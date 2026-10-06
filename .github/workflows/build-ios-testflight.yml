@@ -1,0 +1,175 @@
+name: Build iOS (TestFlight / App Store)
+
+# Builds a SIGNED .ipa and uploads it to App Store Connect. After ~10 minutes of Apple
+# processing it appears in TestFlight; you then share one public TestFlight link with up to
+# 10,000 iPhone users. The same build can later be submitted to the App Store.
+#
+# Needs an Apple Developer Program membership ($99/year) and these repository secrets
+# (Settings → Secrets and variables → Actions → New repository secret) — see README section 8:
+#   APPLE_TEAM_ID                    10-character team ID
+#   IOS_CERTIFICATE_P12_BASE64       "Apple Distribution" certificate exported as .p12, base64
+#   IOS_CERTIFICATE_PASSWORD         password you chose when exporting the .p12
+#   IOS_PROVISIONING_PROFILE_BASE64  App Store provisioning profile (.mobileprovision), base64
+#   ASC_KEY_ID                       App Store Connect API key ID
+#   ASC_ISSUER_ID                    App Store Connect issuer ID
+#   ASC_API_KEY_P8_BASE64            the AuthKey_XXXX.p8 file, base64
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Your backend URL (must be https)"
+        required: true
+        default: "https://papertradelab.com"
+      store:
+        description: "appstore = no purchase screens (required by Apple for App Store / TestFlight)"
+        required: true
+        default: "appstore"
+      upload:
+        description: "Upload to TestFlight after building?"
+        required: true
+        default: "yes"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      KEYCHAIN_PASSWORD: ci-temp-keychain-password
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the app zip (if you uploaded one instead of the folders)
+        run: |
+          Z=$(ls *.zip 2>/dev/null | head -1 || true)
+          if [ -n "$Z" ]; then
+            unzip -o -q "$Z" -d _z
+            D=$(dirname "$(find _z -name pubspec.yaml | head -1)")
+            rm -rf lib android_icons ios_icons
+            cp -r "$D/lib" .
+            [ -d "$D/android_icons" ] && cp -r "$D/android_icons" .
+            [ -d "$D/ios_icons" ] && cp -r "$D/ios_icons" .
+            cp "$D/pubspec.yaml" "$D/analysis_options.yaml" .
+            rm -rf _z
+          fi
+          test -f lib/main.dart && echo "lib folder found"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate the iOS wrapper
+        run: |
+          flutter create --org com.papertradelab --project-name papertradelab --platforms ios .
+          rm -rf test
+
+      - name: Configure the iOS project
+        run: bash .github/scripts/ios-configure.sh
+
+      - name: Install signing certificate and provisioning profile
+        env:
+          CERT_B64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          CERT_PW: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROFILE_B64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for v in CERT_B64 CERT_PW PROFILE_B64 TEAM_ID; do
+            [ -n "${!v}" ] || { echo "::error::Secret for $v is missing - see README section 8"; exit 1; }
+          done
+          CERT=$RUNNER_TEMP/cert.p12
+          PROFILE=$RUNNER_TEMP/app.mobileprovision
+          KC=$RUNNER_TEMP/build.keychain-db
+          echo -n "$CERT_B64"    | base64 --decode > "$CERT"
+          echo -n "$PROFILE_B64" | base64 --decode > "$PROFILE"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
+          security import "$CERT" -P "$CERT_PW" -A -t cert -f pkcs12 -k "$KC"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KC" >/dev/null
+          security list-keychain -d user -s "$KC" login.keychain-db
+
+          # Read the profile's name / UUID / push capability so no extra secrets are needed
+          security cms -D -i "$PROFILE" > "$RUNNER_TEMP/profile.plist"
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")
+          APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")
+          HAS_PUSH=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:aps-environment' "$RUNNER_TEMP/profile.plist" 2>/dev/null || true)
+          echo "profile: $NAME ($UUID) for $APPID, push=${HAS_PUSH:-no}"
+          case "$APPID" in *com.papertradelab.papertradelab) ;; *)
+            echo "::error::Provisioning profile is for $APPID, but the app's bundle ID is com.papertradelab.papertradelab"; exit 1;; esac
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PROFILE" ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID".mobileprovision
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -o '"Apple Distribution[^"]*"\|"iPhone Distribution[^"]*"' | head -1 | tr -d '"')
+          [ -n "$IDENTITY" ] || { echo "::error::No 'Apple Distribution' certificate found in the .p12"; security find-identity -v -p codesigning "$KC"; exit 1; }
+          echo "identity: $IDENTITY"
+
+          # Manual signing for the Runner target only (Pods keep their own settings)
+          {
+            echo ""
+            echo "CODE_SIGN_STYLE = Manual"
+            echo "DEVELOPMENT_TEAM = $TEAM_ID"
+            echo "CODE_SIGN_IDENTITY = $IDENTITY"
+            echo "PROVISIONING_PROFILE_SPECIFIER = $NAME"
+            [ -n "$HAS_PUSH" ] && echo "CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements"
+          } >> ios/Flutter/Release.xcconfig
+          [ -n "$HAS_PUSH" ] || echo "::warning::Profile has no Push Notifications capability - pushes will not work on iOS until you enable it on the App ID and regenerate the profile."
+
+          cat > ios/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>$IDENTITY</string>
+            <key>provisioningProfiles</key><dict>
+              <key>com.papertradelab.papertradelab</key><string>$NAME</string>
+            </dict>
+            <key>uploadSymbols</key><true/>
+            <key>stripSwiftSymbols</key><true/>
+          </dict></plist>
+          EOF
+
+      - name: Get packages
+        run: flutter pub get || flutter pub upgrade --major-versions
+
+      - name: Check the code
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build signed .ipa
+        run: >
+          flutter build ipa --release
+          --build-number=${{ github.run_number }}
+          --dart-define=BASE_URL=${{ inputs.base_url }}
+          --dart-define=STORE=${{ inputs.store }}
+          --export-options-plist=ios/ExportOptions.plist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: papertradelab-ios-signed-ipa
+          path: build/ios/ipa/*.ipa
+
+      - name: Upload to TestFlight
+        if: ${{ inputs.upload == 'yes' }}
+        env:
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          KEY_B64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          for v in KEY_ID ISSUER_ID KEY_B64; do
+            [ -n "${!v}" ] || { echo "::error::Secret for $v is missing - see README section 8"; exit 1; }
+          done
+          mkdir -p ~/private_keys
+          echo -n "$KEY_B64" | base64 --decode > ~/private_keys/AuthKey_$KEY_ID.p8
+          IPA=$(ls build/ios/ipa/*.ipa | head -1)
+          xcrun altool --upload-app --type ios -f "$IPA" --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID"
+          echo "Uploaded. Open App Store Connect → your app → TestFlight; the build appears after Apple finishes processing (5-30 min)."
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
