@@ -1,0 +1,86 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Your backend URL (must be https)"
+        required: true
+        default: "https://papertradelab.com"
+      store:
+        description: "direct = Cashfree in app | play = no purchase screens"
+        required: true
+        default: "direct"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the app zip
+        run: |
+          Z=$(ls *.zip 2>/dev/null | head -1 || true)
+          if [ -n "$Z" ]; then
+            unzip -o -q "$Z" -d _z
+            D=$(dirname "$(find _z -name pubspec.yaml | head -1)")
+            rm -rf lib android_icons
+            cp -r "$D/lib" .
+            if [ -d "$D/android_icons" ]; then cp -r "$D/android_icons" .; fi
+            cp "$D/pubspec.yaml" "$D/analysis_options.yaml" .
+            rm -rf _z
+          fi
+          test -f lib/main.dart && echo "lib folder found"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate the Android wrapper
+        run: |
+          flutter create --org com.papertradelab --project-name papertradelab --platforms android .
+          rm -rf test
+
+      - name: Install the app icon
+        run: |
+          if [ -d android_icons/res ]; then
+            cp -r android_icons/res/. android/app/src/main/res/
+            echo "launcher icons installed"
+          else
+            echo "no android_icons folder - keeping the default Flutter icon"
+          fi
+
+      - name: Set minSdk 23 and allow internet access
+        run: |
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            if [ -f "$f" ]; then sed -i 's/flutter\.minSdkVersion/23/g' "$f"; echo "patched $f"; fi
+          done
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.INTERNET' "$M" || \
+            sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' "$M"
+          sed -i 's/android:label="[^"]*"/android:label="PaperTradeLab"/' "$M"
+
+      - name: Get packages
+        run: flutter pub get || flutter pub upgrade --major-versions
+
+      - name: Check the code
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build APK
+        run: >
+          flutter build apk --release
+          --build-number=${{ github.run_number }}
+          --dart-define=BASE_URL=${{ inputs.base_url }}
+          --dart-define=STORE=${{ inputs.store }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: papertradelab-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
