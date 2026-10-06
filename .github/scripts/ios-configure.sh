@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs on the GitHub macOS runner right after `flutter create --platforms ios .`
-# Makes the generated ios/ folder match the app: name, icon, iOS 13 minimum,
+# Makes the generated ios/ folder match the app: name, icon,
 # portrait only, mail/https links, push notification background mode.
 set -euo pipefail
 
@@ -34,42 +34,13 @@ set_or_add ITSAppUsesNonExemptEncryption bool false
 "$PB" -c "Add :UIBackgroundModes:0 string remote-notification" "$PLIST"
 "$PB" -c "Print" "$PLIST" | sed -n '1,80p'
 
-echo "== Minimum iOS 13 (Firebase 15 needs it)"
-if [ -f ios/Podfile ]; then
-  sed -i '' -E "s/^#? *platform :ios, '[0-9.]+'/platform :ios, '13.0'/" ios/Podfile
-else
-  # Older Flutter versions create the Podfile only on first build; make one now.
-  cat > ios/Podfile <<'EOF'
-platform :ios, '13.0'
-ENV['COCOAPODS_DISABLE_STATS'] = 'true'
-project 'Runner', { 'Debug' => :debug, 'Profile' => :release, 'Release' => :release }
-def flutter_root
-  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
-  unless File.exist?(generated_xcode_build_settings_path)
-    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure flutter pub get is executed first"
-  end
-  File.foreach(generated_xcode_build_settings_path) do |line|
-    matches = line.match(/FLUTTER_ROOT\=(.*)/)
-    return matches[1].strip if matches
-  end
-  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Generated.xcconfig, then run flutter pub get"
-end
-require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
-flutter_ios_podfile_setup
-target 'Runner' do
-  use_frameworks!
-  use_modular_headers!
-  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
-end
-post_install do |installer|
-  installer.pods_project.targets.each do |target|
-    flutter_additional_ios_build_settings(target)
-  end
-end
-EOF
-fi
-grep -n "platform :ios" ios/Podfile
-sed -i '' -E 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' ios/Runner.xcodeproj/project.pbxproj
+echo "== Dependencies via Swift Package Manager (no CocoaPods)"
+# Current Flutter resolves every plugin in this app through Swift Package Manager.
+# A leftover Podfile makes Xcode expect CocoaPods too -> "sandbox is not in sync with Podfile.lock".
+# Flutter recreates a Podfile automatically if a future plugin needs CocoaPods.
+rm -f ios/Podfile ios/Podfile.lock
+rm -rf ios/Pods
+# Flutter sets the minimum iOS version it needs (currently 15.0) during the build.
 
 echo "== App icon"
 if [ -d ios_icons/AppIcon.appiconset ]; then
