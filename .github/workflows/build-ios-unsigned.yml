@@ -1,0 +1,73 @@
+name: Build iOS IPA (unsigned, for sideloading)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Your backend URL (must be https)"
+        required: true
+        default: "https://papertradelab.com"
+      store:
+        description: "direct = Cashfree in app | appstore = no purchase screens"
+        required: true
+        default: "direct"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the app zip
+        run: |
+          Z=$(ls *.zip 2>/dev/null | head -1 || true)
+          if [ -n "$Z" ]; then
+            unzip -o -q "$Z" -d _z
+            D=$(dirname "$(find _z -name pubspec.yaml | head -1)")
+            rm -rf lib android_icons ios_icons
+            cp -r "$D/lib" .
+            [ -d "$D/android_icons" ] && cp -r "$D/android_icons" .
+            [ -d "$D/ios_icons" ] && cp -r "$D/ios_icons" .
+            cp "$D/pubspec.yaml" "$D/analysis_options.yaml" .
+            rm -rf _z
+          fi
+          test -f lib/main.dart && echo "lib folder found"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate the iOS wrapper
+        run: |
+          flutter create --org com.papertradelab --project-name papertradelab --platforms ios .
+          rm -rf test
+
+      - name: Configure the iOS project
+        run: bash .github/scripts/ios-configure.sh
+
+      - name: Get packages
+        run: flutter pub get || flutter pub upgrade --major-versions
+
+      - name: Check the code
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build (no code signing)
+        run: >
+          flutter build ios --release --no-codesign
+          --build-number=${{ github.run_number }}
+          --dart-define=BASE_URL=${{ inputs.base_url }}
+          --dart-define=STORE=${{ inputs.store }}
+
+      - name: Package as .ipa
+        run: |
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qr PaperTradeLab.ipa Payload
+          ls -la PaperTradeLab.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: papertradelab-ios-unsigned-ipa
+          path: PaperTradeLab.ipa
